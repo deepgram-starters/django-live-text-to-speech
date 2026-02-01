@@ -11,6 +11,7 @@ ALLOWED_HOSTS = ['*']
 
 INSTALLED_APPS = [
     'daphne',  # Must be first for Channels
+    'django.contrib.staticfiles',
     'starter',
     'channels',
 ]
@@ -31,7 +32,8 @@ CHANNEL_LAYERS = {
 }
 
 DATABASES = {}
-STATIC_URL = '/'
-STATIC_ROOT = BASE_DIR / 'frontend' / 'dist'
+STATIC_URL = '/assets/'
+STATIC_ROOT = BASE_DIR / 'frontend' / 'dist' / 'assets'
+STATICFILES_DIRS = [BASE_DIR / 'frontend' / 'dist']
 CORS_ALLOW_ALL_ORIGINS = True
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
