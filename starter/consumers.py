@@ -48,6 +48,9 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             )
             print("✓ Connected to Deepgram TTS API")
 
+            # Notify client that connection is ready
+            await self.send(text_data=json.dumps({'type': 'Open'}))
+
             # Start forwarding task
             self.forward_task = asyncio.create_task(self.forward_from_deepgram())
 
