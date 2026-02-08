@@ -11,7 +11,6 @@ ALLOWED_HOSTS = ['*']
 
 PORT = int(os.environ.get('PORT', 8081))
 HOST = os.environ.get('HOST', '0.0.0.0')
-FRONTEND_PORT = int(os.environ.get('FRONTEND_PORT', 8080))
 
 INSTALLED_APPS = [
     'daphne',  # Must be first for Channels
@@ -37,10 +36,6 @@ CHANNEL_LAYERS = {
 
 DATABASES = {}
 
-CORS_ALLOWED_ORIGINS = [
-    f"http://localhost:{FRONTEND_PORT}",
-    f"http://127.0.0.1:{FRONTEND_PORT}",
-]
-CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_ALL_ORIGINS = True
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
