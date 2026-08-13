@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from deepgram import AsyncDeepgramClient
 from deepgram.environment import DeepgramClientEnvironment
+from deepgram.core.api_error import ApiError
 from deepgram.speak.v1.types import SpeakV1Text
 from starter.views import SESSION_SECRET
 
@@ -40,6 +41,19 @@ def _build_client():
 
 
 deepgram = _build_client()
+
+
+def _safe_error_detail(e):
+    """Build a browser-safe (and log-safe) description of a Deepgram error.
+
+    NEVER surface str(e): a deepgram-sdk ApiError stringifies its request
+    headers, which include `Authorization: Token <api-key>`. Forwarding that
+    to the browser (or writing it to logs) leaks the API key, so we only ever
+    expose the exception's HTTP status or type name.
+    """
+    if isinstance(e, ApiError):
+        return f"Deepgram rejected the connection (HTTP {e.status_code})"
+    return f"Failed to connect to Deepgram ({type(e).__name__})"
 
 
 class LiveTTSConsumer(AsyncWebsocketConsumer):
@@ -99,10 +113,11 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             self.forward_task = asyncio.create_task(self.forward_from_deepgram())
 
         except Exception as e:
-            print(f"Error connecting to Deepgram: {e}")
+            detail = _safe_error_detail(e)
+            print(f"Error connecting to Deepgram: {detail}")
             await self.send(text_data=json.dumps({
                 "type": "Error",
-                "description": str(e),
+                "description": detail,
                 "code": "CONNECTION_FAILED"
             }))
             await self.close(code=3000)
@@ -122,7 +137,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             try:
                 await self._connection_cm.__aexit__(None, None, None)
             except Exception as e:
-                print(f"Error closing Deepgram connection: {e}")
+                print(f"Error closing Deepgram connection: {_safe_error_detail(e)}")
 
     async def receive(self, text_data=None, bytes_data=None):
         """Forward browser control messages (JSON) to Deepgram."""
@@ -147,7 +162,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             else:
                 print(f"Ignoring unknown client message type: {msg_type}")
         except Exception as e:
-            print(f"Error forwarding to Deepgram: {e}")
+            print(f"Error forwarding to Deepgram: {_safe_error_detail(e)}")
 
     async def forward_from_deepgram(self):
         """Forward Deepgram messages to the browser: bytes as binary, models as JSON."""
@@ -164,11 +179,12 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"Error forwarding from Deepgram: {e}")
+            detail = _safe_error_detail(e)
+            print(f"Error forwarding from Deepgram: {detail}")
             try:
                 await self.send(text_data=json.dumps({
                     "type": "Error",
-                    "description": str(e),
+                    "description": detail,
                     "code": "PROVIDER_ERROR"
                 }))
             except Exception:
