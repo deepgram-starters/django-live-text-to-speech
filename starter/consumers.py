@@ -1,12 +1,17 @@
-"""WebSocket consumer for Live TTS - Raw WebSocket proxy to Deepgram"""
+"""WebSocket consumer for Live TTS — bridges the browser to Deepgram speak.v1 via the SDK."""
 import os
 import json
 import asyncio
 from urllib.parse import parse_qs
-from channels.generic.websocket import AsyncWebsocketConsumer
-import websockets
+
 import jwt
+from channels.generic.websocket import AsyncWebsocketConsumer
 from dotenv import load_dotenv
+
+from deepgram import AsyncDeepgramClient
+from deepgram.environment import DeepgramClientEnvironment
+from deepgram.core.api_error import ApiError
+from deepgram.speak.v1.types import SpeakV1Text
 from starter.views import SESSION_SECRET
 
 load_dotenv()
@@ -14,15 +19,60 @@ API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 if not API_KEY:
     raise ValueError("DEEPGRAM_API_KEY required")
 
-DEEPGRAM_TTS_URL = "wss://api.deepgram.com/v1/speak"
+DEFAULT_MODEL = "aura-asteria-en"
+DEFAULT_ENCODING = "linear16"
+DEFAULT_SAMPLE_RATE = "48000"
+DEFAULT_CONTAINER = "none"
+
+
+# One async SDK client, reused across connections; the browser never sees the API key.
+# DEEPGRAM_BASE_URL (e.g. wss://api.staging.deepgram.com) overrides the default
+# production endpoint. speak.v1 uses environment.production for the /v1/speak ws.
+def _build_client():
+    base_url = os.environ.get("DEEPGRAM_BASE_URL")
+    if base_url:
+        https = base_url.replace("wss://", "https://").replace("ws://", "http://")
+        env = DeepgramClientEnvironment(
+            base=https, production=base_url, agent=base_url, agent_rest=https
+        )
+        print(f"Using custom Deepgram base URL: {base_url}")
+        return AsyncDeepgramClient(api_key=API_KEY, environment=env)
+    return AsyncDeepgramClient(api_key=API_KEY)
+
+
+deepgram = _build_client()
+
+
+def _safe_error_detail(e, operation):
+    """Build a browser-safe (and log-safe) description of a Deepgram error.
+
+    NEVER surface str(e): a deepgram-sdk ApiError stringifies its request
+    headers, which include `Authorization: Token <api-key>`. Forwarding that
+    to the browser (or writing it to logs) leaks the API key, so we only ever
+    expose the exception's HTTP status or type name.
+    """
+    if isinstance(e, ApiError):
+        return f"Deepgram rejected the {operation} (HTTP {e.status_code})"
+    return f"Deepgram failed during {operation} ({type(e).__name__})"
+
+
+def _browser_error(code, detail):
+    return json.dumps({
+        "type": "Error",
+        "error": {
+            "type": "ProviderError",
+            "code": code,
+            "message": detail,
+        },
+    })
 
 
 class LiveTTSConsumer(AsyncWebsocketConsumer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.deepgram_ws = None
+        self.connection = None
+        self._connection_cm = None
         self.forward_task = None
-        self.stop_event = asyncio.Event()
 
     async def connect(self):
         """Accept WebSocket connection from client"""
@@ -50,40 +100,38 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
         query_string = self.scope.get('query_string', b'').decode('utf-8')
         params = parse_qs(query_string)
 
-        model = params.get('model', ['aura-asteria-en'])[0]
-        encoding = params.get('encoding', ['linear16'])[0]
-        sample_rate = params.get('sample_rate', ['48000'])[0]
-        container = params.get('container', ['none'])[0]
-
-        # Build Deepgram WebSocket URL with parameters
-        deepgram_url = f"{DEEPGRAM_TTS_URL}?model={model}&encoding={encoding}&sample_rate={sample_rate}&container={container}"
+        model = params.get('model', [DEFAULT_MODEL])[0]
+        encoding = params.get('encoding', [DEFAULT_ENCODING])[0]
+        sample_rate = params.get('sample_rate', [DEFAULT_SAMPLE_RATE])[0]
+        container = params.get('container', [DEFAULT_CONTAINER])[0]
 
         print(f"Connecting to Deepgram TTS: model={model}, encoding={encoding}, sample_rate={sample_rate}")
 
         try:
-            # Connect to Deepgram
-            self.deepgram_ws = await websockets.connect(
-                deepgram_url,
-                additional_headers={"Authorization": f"Token {API_KEY}"}
+            # `connect()` is an async context manager; enter it manually so the
+            # connection lives across the consumer's connect/disconnect lifecycle.
+            # `container` is not a first-class connect() kwarg, so pass it through
+            # as an additional query parameter to preserve the original behavior.
+            self._connection_cm = deepgram.speak.v1.connect(
+                model=model,
+                encoding=encoding,
+                sample_rate=sample_rate,
+                request_options={"additional_query_parameters": {"container": container}},
             )
-            print("✓ Connected to Deepgram TTS API")
+            self.connection = await self._connection_cm.__aenter__()
+            print("Connected to Deepgram TTS API")
 
-            # Start forwarding task
             self.forward_task = asyncio.create_task(self.forward_from_deepgram())
 
         except Exception as e:
-            print(f"Error connecting to Deepgram: {e}")
-            await self.send(text_data=json.dumps({
-                "type": "Error",
-                "description": str(e),
-                "code": "CONNECTION_FAILED"
-            }))
+            detail = _safe_error_detail(e, "connection")
+            print(f"Error connecting to Deepgram: {detail}")
+            await self.send(text_data=_browser_error("CONNECTION_FAILED", detail))
             await self.close(code=3000)
 
     async def disconnect(self, close_code):
         """Cleanup on disconnect"""
         print(f"Client disconnected: {close_code}")
-        self.stop_event.set()
 
         if self.forward_task:
             self.forward_task.cancel()
@@ -92,50 +140,75 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             except asyncio.CancelledError:
                 pass
 
-        if self.deepgram_ws:
+        if self._connection_cm:
             try:
-                await self.deepgram_ws.close()
+                await self._connection_cm.__aexit__(None, None, None)
             except Exception as e:
-                print(f"Error closing Deepgram connection: {e}")
+                print(f"Error closing Deepgram connection: {_safe_error_detail(e, 'connection close')}")
 
     async def receive(self, text_data=None, bytes_data=None):
-        """Forward messages from client to Deepgram"""
-        if not self.deepgram_ws:
+        """Forward browser control messages (JSON) to Deepgram."""
+        if not self.connection or not text_data:
+            return
+        try:
+            data = json.loads(text_data)
+        except (ValueError, TypeError):
+            print("Ignoring non-JSON message from client")
             return
 
+        msg_type = data.get("type")
         try:
-            if text_data:
-                await self.deepgram_ws.send(text_data)
-            elif bytes_data:
-                await self.deepgram_ws.send(bytes_data)
+            if msg_type == "Speak":
+                await self.connection.send_text(SpeakV1Text(text=data.get("text", "")))
+            elif msg_type == "Flush":
+                await self.connection.send_flush()
+            elif msg_type == "Clear":
+                await self.connection.send_clear()
+            elif msg_type == "Close":
+                await self.connection.send_close()
+            else:
+                print(f"Ignoring unknown client message type: {msg_type}")
         except Exception as e:
-            print(f"Error forwarding to Deepgram: {e}")
+            detail = _safe_error_detail(e, "audio generation")
+            print(f"Error forwarding to Deepgram: {detail}")
+            await self.send(text_data=_browser_error("AUDIO_GENERATION_ERROR", detail))
             await self.close(code=3000)
 
     async def forward_from_deepgram(self):
-        """Forward messages from Deepgram to client"""
+        """Forward Deepgram messages to the browser: bytes as binary and JSON as text."""
         try:
-            async for message in self.deepgram_ws:
-                if self.stop_event.is_set():
-                    break
-
-                # Forward binary or text messages
-                if isinstance(message, bytes):
-                    await self.send(bytes_data=message)
+            # The SDK's response parser neither models nor preserves TTS Error
+            # frames. Read its transport directly, then normalize provider
+            # errors to the browser contract while sends remain typed.
+            async for message in self.connection._websocket:
+                if isinstance(message, (bytes, bytearray)):
+                    await self.send(bytes_data=bytes(message))
                 else:
+                    try:
+                        provider_message = json.loads(message)
+                    except (TypeError, ValueError):
+                        provider_message = None
+                    if (
+                        isinstance(provider_message, dict)
+                        and provider_message.get("type") == "Error"
+                    ):
+                        await self.send(text_data=_browser_error(
+                            "AUDIO_GENERATION_ERROR",
+                            "Deepgram reported an audio generation error",
+                        ))
+                        continue
                     await self.send(text_data=message)
-
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"Deepgram connection closed: {e.code} {e.reason}")
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"Error forwarding from Deepgram: {e}")
-            await self.send(text_data=json.dumps({
-                "type": "Error",
-                "description": str(e),
-                "code": "PROVIDER_ERROR"
-            }))
+            detail = _safe_error_detail(e, "audio forwarding")
+            print(f"Error forwarding from Deepgram: {detail}")
+            try:
+                await self.send(text_data=_browser_error("AUDIO_GENERATION_ERROR", detail))
+            except Exception:
+                pass
         finally:
-            if not self.stop_event.is_set():
+            try:
                 await self.close(code=1000)
+            except Exception:
+                pass
