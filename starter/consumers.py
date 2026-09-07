@@ -56,6 +56,17 @@ def _safe_error_detail(e):
     return f"Failed to connect to Deepgram ({type(e).__name__})"
 
 
+def _browser_error(code, detail):
+    return json.dumps({
+        "type": "Error",
+        "error": {
+            "type": "ProviderError",
+            "code": code,
+            "message": detail,
+        },
+    })
+
+
 class LiveTTSConsumer(AsyncWebsocketConsumer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -115,11 +126,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             detail = _safe_error_detail(e)
             print(f"Error connecting to Deepgram: {detail}")
-            await self.send(text_data=json.dumps({
-                "type": "Error",
-                "description": detail,
-                "code": "CONNECTION_FAILED"
-            }))
+            await self.send(text_data=_browser_error("CONNECTION_FAILED", detail))
             await self.close(code=3000)
 
     async def disconnect(self, close_code):
@@ -162,7 +169,10 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             else:
                 print(f"Ignoring unknown client message type: {msg_type}")
         except Exception as e:
-            print(f"Error forwarding to Deepgram: {_safe_error_detail(e)}")
+            detail = _safe_error_detail(e)
+            print(f"Error forwarding to Deepgram: {detail}")
+            await self.send(text_data=_browser_error("AUDIO_GENERATION_ERROR", detail))
+            await self.close(code=3000)
 
     async def forward_from_deepgram(self):
         """Forward Deepgram messages to the browser: bytes as binary, models as JSON."""
@@ -182,11 +192,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             detail = _safe_error_detail(e)
             print(f"Error forwarding from Deepgram: {detail}")
             try:
-                await self.send(text_data=json.dumps({
-                    "type": "Error",
-                    "description": detail,
-                    "code": "PROVIDER_ERROR"
-                }))
+                await self.send(text_data=_browser_error("AUDIO_GENERATION_ERROR", detail))
             except Exception:
                 pass
         finally:
