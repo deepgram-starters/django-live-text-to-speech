@@ -1,10 +1,12 @@
 import json
 import os
 from unittest import IsolatedAsyncioTestCase
+from unittest.mock import patch
 
 os.environ.setdefault("DEEPGRAM_API_KEY", "test-key")
 
-from starter.consumers import LiveTTSConsumer, _browser_error
+from deepgram.core.api_error import ApiError
+from starter.consumers import LiveTTSConsumer, _browser_error, _safe_error_detail
 
 
 class RecordingConnection:
@@ -45,6 +47,17 @@ class ProviderErrorConnection:
         return message
 
 
+class ConnectionContextManager:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, *_):
+        return None
+
+
 class ConsumerTests(IsolatedAsyncioTestCase):
     def make_consumer(self, connection):
         consumer = LiveTTSConsumer()
@@ -64,6 +77,38 @@ class ConsumerTests(IsolatedAsyncioTestCase):
             connection.calls,
             [("Speak", "Hello"), ("Flush", None), ("Clear", None), ("Close", None)],
         )
+
+    async def test_connect_passes_all_audio_options_to_sdk(self):
+        consumer = LiveTTSConsumer()
+        consumer.scope = {
+            "subprotocols": ["access_token.test-token"],
+            "query_string": b"?model=aura-asteria-en&encoding=linear16&sample_rate=48000&container=wav",
+        }
+        context_manager = ConnectionContextManager(RecordingConnection())
+        accepted = []
+
+        async def accept(*, subprotocol=None):
+            accepted.append(subprotocol)
+
+        async def forward_from_deepgram():
+            return None
+
+        consumer.accept = accept
+        consumer.forward_from_deepgram = forward_from_deepgram
+
+        with patch("starter.consumers.jwt.decode"), patch(
+            "starter.consumers.deepgram.speak.v1.connect", return_value=context_manager
+        ) as connect:
+            await consumer.connect()
+
+        connect.assert_called_once_with(
+            model="aura-asteria-en",
+            encoding="linear16",
+            sample_rate="48000",
+            request_options={"additional_query_parameters": {"container": "wav"}},
+        )
+        self.assertEqual(accepted, ["access_token.test-token"])
+        await consumer.forward_task
 
     async def test_upstream_write_failure_notifies_and_closes_browser(self):
         consumer = self.make_consumer(BrokenConnection())
@@ -86,7 +131,7 @@ class ConsumerTests(IsolatedAsyncioTestCase):
             "error": {
                 "type": "ProviderError",
                 "code": "AUDIO_GENERATION_ERROR",
-                "message": "Failed to connect to Deepgram (RuntimeError)",
+                "message": "Deepgram failed during audio generation (RuntimeError)",
             },
         })
         self.assertEqual(closed, [3000])
@@ -125,3 +170,18 @@ class ConsumerTests(IsolatedAsyncioTestCase):
                 "message": "No connection",
             },
         })
+
+    def test_api_error_detail_excludes_authorization_header(self):
+        error = ApiError(
+            status_code=400,
+            headers={"Authorization": "Token test-key"},
+            body="Invalid request",
+        )
+        browser_error = _browser_error(
+            "CONNECTION_FAILED", _safe_error_detail(error, "connection")
+        )
+
+        self.assertIn("HTTP 400", browser_error)
+        self.assertNotIn("test-key", browser_error)
+        self.assertNotIn("Token", browser_error)
+        self.assertNotIn("Authorization", browser_error)

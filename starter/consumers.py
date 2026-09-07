@@ -43,7 +43,7 @@ def _build_client():
 deepgram = _build_client()
 
 
-def _safe_error_detail(e):
+def _safe_error_detail(e, operation):
     """Build a browser-safe (and log-safe) description of a Deepgram error.
 
     NEVER surface str(e): a deepgram-sdk ApiError stringifies its request
@@ -52,8 +52,8 @@ def _safe_error_detail(e):
     expose the exception's HTTP status or type name.
     """
     if isinstance(e, ApiError):
-        return f"Deepgram rejected the connection (HTTP {e.status_code})"
-    return f"Failed to connect to Deepgram ({type(e).__name__})"
+        return f"Deepgram rejected the {operation} (HTTP {e.status_code})"
+    return f"Deepgram failed during {operation} ({type(e).__name__})"
 
 
 def _browser_error(code, detail):
@@ -124,7 +124,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             self.forward_task = asyncio.create_task(self.forward_from_deepgram())
 
         except Exception as e:
-            detail = _safe_error_detail(e)
+            detail = _safe_error_detail(e, "connection")
             print(f"Error connecting to Deepgram: {detail}")
             await self.send(text_data=_browser_error("CONNECTION_FAILED", detail))
             await self.close(code=3000)
@@ -144,7 +144,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             try:
                 await self._connection_cm.__aexit__(None, None, None)
             except Exception as e:
-                print(f"Error closing Deepgram connection: {_safe_error_detail(e)}")
+                print(f"Error closing Deepgram connection: {_safe_error_detail(e, 'connection close')}")
 
     async def receive(self, text_data=None, bytes_data=None):
         """Forward browser control messages (JSON) to Deepgram."""
@@ -169,7 +169,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
             else:
                 print(f"Ignoring unknown client message type: {msg_type}")
         except Exception as e:
-            detail = _safe_error_detail(e)
+            detail = _safe_error_detail(e, "audio generation")
             print(f"Error forwarding to Deepgram: {detail}")
             await self.send(text_data=_browser_error("AUDIO_GENERATION_ERROR", detail))
             await self.close(code=3000)
@@ -188,7 +188,7 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            detail = _safe_error_detail(e)
+            detail = _safe_error_detail(e, "audio forwarding")
             print(f"Error forwarding from Deepgram: {detail}")
             try:
                 await self.send(text_data=_browser_error("AUDIO_GENERATION_ERROR", detail))
