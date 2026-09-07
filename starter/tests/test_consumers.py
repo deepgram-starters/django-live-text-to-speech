@@ -29,6 +29,22 @@ class BrokenConnection:
         raise RuntimeError("upstream lost")
 
 
+class ProviderErrorConnection:
+    def __init__(self, message):
+        self._websocket = self
+        self.message = json.dumps(message)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.message is None:
+            raise StopAsyncIteration
+        message = self.message
+        self.message = None
+        return message
+
+
 class ConsumerTests(IsolatedAsyncioTestCase):
     def make_consumer(self, connection):
         consumer = LiveTTSConsumer()
@@ -74,6 +90,31 @@ class ConsumerTests(IsolatedAsyncioTestCase):
             },
         })
         self.assertEqual(closed, [3000])
+
+    async def test_unmodeled_provider_error_reaches_browser(self):
+        provider_error = {
+            "type": "Error",
+            "error": {
+                "type": "ProviderError",
+                "code": "AUDIO_GENERATION_ERROR",
+                "message": "Upstream synthesis failed",
+            },
+        }
+        consumer = self.make_consumer(ProviderErrorConnection(provider_error))
+        sent = []
+
+        async def send(*, text_data=None, bytes_data=None):
+            sent.append((text_data, bytes_data))
+
+        async def close(code=None):
+            return None
+
+        consumer.send = send
+        consumer.close = close
+
+        await consumer.forward_from_deepgram()
+
+        self.assertEqual(json.loads(sent[0][0]), provider_error)
 
     def test_browser_errors_use_the_contract_envelope(self):
         self.assertEqual(json.loads(_browser_error("CONNECTION_FAILED", "No connection")), {
