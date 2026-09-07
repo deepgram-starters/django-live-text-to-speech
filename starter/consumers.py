@@ -178,12 +178,25 @@ class LiveTTSConsumer(AsyncWebsocketConsumer):
         """Forward Deepgram messages to the browser: bytes as binary and JSON as text."""
         try:
             # The SDK's response parser neither models nor preserves TTS Error
-            # frames. Read its transport directly so browser clients receive
-            # every provider JSON frame unchanged, while sends remain typed.
+            # frames. Read its transport directly, then normalize provider
+            # errors to the browser contract while sends remain typed.
             async for message in self.connection._websocket:
                 if isinstance(message, (bytes, bytearray)):
                     await self.send(bytes_data=bytes(message))
                 else:
+                    try:
+                        provider_message = json.loads(message)
+                    except (TypeError, ValueError):
+                        provider_message = None
+                    if (
+                        isinstance(provider_message, dict)
+                        and provider_message.get("type") == "Error"
+                    ):
+                        await self.send(text_data=_browser_error(
+                            "AUDIO_GENERATION_ERROR",
+                            "Deepgram reported an audio generation error",
+                        ))
+                        continue
                     await self.send(text_data=message)
         except asyncio.CancelledError:
             pass

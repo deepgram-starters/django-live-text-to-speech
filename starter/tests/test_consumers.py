@@ -136,14 +136,11 @@ class ConsumerTests(IsolatedAsyncioTestCase):
         })
         self.assertEqual(closed, [3000])
 
-    async def test_unmodeled_provider_error_reaches_browser(self):
+    async def test_legacy_provider_error_is_normalized_for_browser(self):
         provider_error = {
             "type": "Error",
-            "error": {
-                "type": "ProviderError",
-                "code": "AUDIO_GENERATION_ERROR",
-                "message": "Upstream synthesis failed",
-            },
+            "description": "Upstream synthesis failed",
+            "code": "PROVIDER_ERROR",
         }
         consumer = self.make_consumer(ProviderErrorConnection(provider_error))
         sent = []
@@ -159,7 +156,14 @@ class ConsumerTests(IsolatedAsyncioTestCase):
 
         await consumer.forward_from_deepgram()
 
-        self.assertEqual(json.loads(sent[0][0]), provider_error)
+        self.assertEqual(json.loads(sent[0][0]), {
+            "type": "Error",
+            "error": {
+                "type": "ProviderError",
+                "code": "AUDIO_GENERATION_ERROR",
+                "message": "Deepgram reported an audio generation error",
+            },
+        })
 
     def test_browser_errors_use_the_contract_envelope(self):
         self.assertEqual(json.loads(_browser_error("CONNECTION_FAILED", "No connection")), {
